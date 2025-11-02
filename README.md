@@ -57,3 +57,4 @@ Tips:
 - Keep port 7000 (or whichever you use) firewalled; let the reverse proxy handle public traffic.
 - Renew certificates automatically (cron/systemd timer or your proxy’s auto-renew feature).
 - If you deploy behind Cloudflare or another CDN, ensure WebDAV/body sizes are allowed and HTTPS certificates stay valid.
+- Finally, add `https://myusenet.duckdns.org/manifest.json` (replace with your domain) to Stremio’s addon catalog.
