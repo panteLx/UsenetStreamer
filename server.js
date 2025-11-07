@@ -1042,6 +1042,44 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
 
   console.log(`[NZBDAV] Proxying ${proxiedMethod}${emulateHead ? ' (HEAD emulation)' : ''} ${targetUrl}`);
 
+  // If no Range header was requested by client, we need to get file size first
+  let totalFileSize = null;
+  if (!req.headers.range && !emulateHead) {
+    try {
+      console.log('[NZBDAV] No range requested, fetching file size via HEAD...');
+      const headConfig = {
+        url: targetUrl,
+        method: 'HEAD',
+        headers: {
+          'User-Agent': headers['User-Agent'] || 'UsenetStreamer/1.0'
+        },
+        timeout: 30000,
+        validateStatus: (status) => status < 500
+      };
+      
+      if (NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
+        headConfig.auth = {
+          username: NZBDAV_WEBDAV_USER,
+          password: NZBDAV_WEBDAV_PASS
+        };
+      }
+      
+      const headResponse = await axios.request(headConfig);
+      const headHeadersLower = Object.keys(headResponse.headers || {}).reduce((map, key) => {
+        map[key.toLowerCase()] = headResponse.headers[key];
+        return map;
+      }, {});
+      
+      const contentLength = headHeadersLower['content-length'];
+      if (contentLength) {
+        totalFileSize = Number(contentLength);
+        console.log(`[NZBDAV] File size from HEAD: ${totalFileSize} bytes`);
+      }
+    } catch (headError) {
+      console.warn('[NZBDAV] HEAD request failed, will try without size:', headError.message);
+    }
+  }
+
   const nzbdavResponse = await axios.request(requestConfig);
 
   let responseStatus = nzbdavResponse.status;
@@ -1051,8 +1089,13 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
   }, {});
 
   const incomingContentRange = responseHeadersLower['content-range'];
-  if (incomingContentRange && responseStatus === 200) {
-    responseStatus = 206;
+
+  // Force 206 status if Content-Range header exists (even if WebDAV returned 200)
+  if (incomingContentRange) {
+    if (responseStatus === 200) {
+      responseStatus = 206;
+      console.log('[NZBDAV] Converting HTTP 200 to 206 Partial Content (Content-Range detected)');
+    }
   }
 
   res.status(responseStatus);
@@ -1085,24 +1128,47 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
     res.setHeader('Accept-Ranges', 'bytes');
   }
 
+  // Calculate Content-Length from Content-Range if missing
   let contentLengthHeader = res.getHeader('Content-Length');
-  if ((!contentLengthHeader || Number(contentLengthHeader) === 0) && incomingContentRange) {
-    const match = incomingContentRange.match(/bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
+
+  if (incomingContentRange) {
+    const match = incomingContentRange.match(/bytes\s+(\d+)-(\d+)\s*\/\s*(\d+|\*)/i);
+    
     if (match) {
       const start = Number(match[1]);
       const end = Number(match[2]);
+      const totalSize = match[3] !== '*' ? Number(match[3]) : null;
+      
+      // Always calculate and set Content-Length from range
       const chunkLength = Number.isFinite(start) && Number.isFinite(end) ? end - start + 1 : null;
-      if (Number.isFinite(chunkLength)) {
+      console.log('[NZBDAV] Calculated chunk length:', { start, end, chunkLength, totalSize });
+      
+      if (Number.isFinite(chunkLength) && chunkLength > 0) {
         res.setHeader('Content-Length', String(chunkLength));
+        console.log(`[NZBDAV] ✅ Set Content-Length: ${chunkLength} (from Content-Range: bytes ${start}-${end}/${totalSize || '*'})`);
+      } else {
+        console.error('[NZBDAV] ❌ Failed to calculate valid chunk length!');
       }
-      if (match[3] && match[3] !== '*' && !res.getHeader('X-Total-Length')) {
-        res.setHeader('X-Total-Length', match[3]);
+      
+      // Set total size header for informational purposes
+      if (totalSize && Number.isFinite(totalSize)) {
+        res.setHeader('X-Total-Length', String(totalSize));
       }
+    } else {
+      console.error('[NZBDAV] ❌ Failed to parse Content-Range header!');
+    }
+  } else if (!contentLengthHeader || Number(contentLengthHeader) === 0) {
+    // Use the file size we got from HEAD request
+    if (totalFileSize && Number.isFinite(totalFileSize)) {
+      res.setHeader('Content-Length', String(totalFileSize));
+      console.log(`[NZBDAV] Set Content-Length: ${totalFileSize} (from HEAD request)`);
+    } else {
+      console.warn('[NZBDAV] ⚠️  Warning: No Content-Length or Content-Range header available');
     }
   }
 
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
 
   if (emulateHead || !nzbdavResponse.data || typeof nzbdavResponse.data.pipe !== 'function') {
     if (nzbdavResponse.data && typeof nzbdavResponse.data.destroy === 'function') {
