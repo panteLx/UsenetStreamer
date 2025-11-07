@@ -1,0 +1,47 @@
+services:
+  usenetstreamer-v2:
+    build: .
+    container_name: usenetstreamer-v2
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - usenet-network
+      - proxy-network
+
+  nzbdav-v2:
+    image: nzbdav/nzbdav:alpha
+    container_name: nzbdav-v2
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Berlin
+    volumes:
+      - nzbdav-config:/config
+    restart: unless-stopped
+    networks:
+      - usenet-network
+      - proxy-network
+
+  nzbhydra2:
+    image: lscr.io/linuxserver/nzbhydra2:latest
+    container_name: nzbhydra2
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Berlin
+    volumes:
+      - nzbhydra2-config:/config
+    restart: unless-stopped
+    networks:
+      - usenet-network
+      - proxy-network
+
+networks:
+  usenet-network:
+  proxy-network:
+    external: true
+
+volumes:
+  nzbdav-config:
+  nzbhydra2-config:
