@@ -1,7 +1,7 @@
 services:
-  usenetstreamer-v2:
+  usenetstreamer:
     build: .
-    container_name: usenetstreamer-v2
+    container_name: usenetstreamer
     restart: unless-stopped
     env_file:
       - .env
@@ -9,9 +9,9 @@ services:
       - usenet-network
       - proxy-network
 
-  nzbdav-v2:
+  nzbdav:
     image: nzbdav/nzbdav:alpha
-    container_name: nzbdav-v2
+    container_name: nzbdav
     environment:
       - PUID=1000
       - PGID=1000
