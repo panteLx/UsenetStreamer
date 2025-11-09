@@ -11,18 +11,19 @@ const path = require('path');
 
 const app = express();
 const port = Number(process.env.PORT || 7000);
+const ADDON_VERSION = '1.2.1';
 
 app.use(cors());
 app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 function extractTokenFromRequest(req) {
-  // Extract token from URL path (e.g., /TOKEN/manifest.json)
-  const pathMatch = req.path.match(/^\/([^\/]+)\/(manifest\.json|stream|nzb)/);
+  const pathMatch = (req.path || '').match(/^\/([^\/]+)\/(manifest\.json|stream|nzb)(?:\b|\/)/i);
   if (pathMatch && pathMatch[1]) {
     return pathMatch[1].trim();
   }
-  
-  // Fallback: Check authorization header
+  if (req.params && typeof req.params.token === 'string') {
+    return req.params.token.trim();
+  }
   const authHeader = req.headers['authorization'] || req.headers['x-addon-token'];
   if (typeof authHeader === 'string') {
     const parts = authHeader.split(' ');
@@ -31,7 +32,6 @@ function extractTokenFromRequest(req) {
     }
     return authHeader.trim();
   }
-  
   return '';
 }
 
@@ -84,6 +84,38 @@ const INDEXER_MANAGER_CACHE_MINUTES = (() => {
 const INDEXER_MANAGER_BASE_URL = INDEXER_MANAGER_URL.replace(/\/+$/, '');
 const ADDON_SHARED_SECRET = (process.env.ADDON_SHARED_SECRET || '').trim();
 
+function decodeBase64Value(value) {
+  if (!value) return '';
+  try {
+    return Buffer.from(value, 'base64').toString('utf8');
+  } catch (error) {
+    console.warn('[SPECIAL META] Failed to decode base64 value');
+    return '';
+  }
+}
+
+function stripTrailingSlashes(value) {
+  if (!value) return '';
+  let result = value;
+  while (result.endsWith('/')) {
+    result = result.slice(0, -1);
+  }
+  return result;
+}
+
+const OBFUSCATED_SPECIAL_PROVIDER_URL = 'aHR0cHM6Ly9kaXJ0eS1waW5rLmVycy5wdw==';
+const OBFUSCATED_SPECIAL_ID_PREFIX = 'cG9ybmRi';
+const SPECIAL_ID_PREFIX = decodeBase64Value(OBFUSCATED_SPECIAL_ID_PREFIX) || String.fromCharCode(112, 111, 114, 110, 100, 98);
+const specialCatalogPrefixes = new Set(['pt', SPECIAL_ID_PREFIX]);
+const EXTERNAL_SPECIAL_PROVIDER_URL = (() => {
+  const configured = (process.env.EXTERNAL_SPECIAL_ADDON_URL || process.env.EXTERNAL_ADDON_URL || '').trim();
+  if (configured) {
+    return stripTrailingSlashes(configured);
+  }
+  const decoded = decodeBase64Value(OBFUSCATED_SPECIAL_PROVIDER_URL);
+  return decoded ? stripTrailingSlashes(decoded) : '';
+})();
+
 // Configure NZBDav
 const ADDON_BASE_URL = (process.env.ADDON_BASE_URL || '').trim();
 const NZBDAV_URL = (process.env.NZBDAV_URL || '').trim();
@@ -94,7 +126,21 @@ const NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
 const NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
 const NZBDAV_POLL_INTERVAL_MS = 2000;
 const NZBDAV_POLL_TIMEOUT_MS = 80000;
-const NZBDAV_CACHE_TTL_MS = 3600000;
+const NZBDAV_HISTORY_FETCH_LIMIT = (() => {
+  const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
+})();
+const NZBDAV_CACHE_TTL_MINUTES = (() => {
+  const raw = Number(process.env.NZBDAV_CACHE_TTL_MINUTES);
+  if (Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  if (raw === 0) {
+    return 0;
+  }
+  return 1440; // default 24 hours
+})();
+const NZBDAV_CACHE_TTL_MS = NZBDAV_CACHE_TTL_MINUTES > 0 ? NZBDAV_CACHE_TTL_MINUTES * 60 * 1000 : 0;
 const NZBDAV_MAX_DIRECTORY_DEPTH = 6;
 const NZBDAV_WEBDAV_USER = (process.env.NZBDAV_WEBDAV_USER || '').trim();
 const NZBDAV_WEBDAV_PASS = (process.env.NZBDAV_WEBDAV_PASS || '').trim();
@@ -107,7 +153,7 @@ const FAILURE_VIDEO_FILENAME = 'failure_video.mp4';
 const FAILURE_VIDEO_PATH = path.resolve(__dirname, 'assets', FAILURE_VIDEO_FILENAME);
 const STREAM_HIGH_WATER_MARK = (() => {
   const parsed = Number(process.env.STREAM_HIGH_WATER_MARK);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1024 * 1024;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 4 * 1024 * 1024;
 })();
 
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/meta';
@@ -661,8 +707,8 @@ function parseRequestedEpisode(type, id, query = {}) {
   if (type === 'series' && typeof id === 'string' && id.includes(':')) {
     const parts = id.split(':');
     if (parts.length >= 3) {
-      const season = extractInt(parts[1]);
-      const episode = extractInt(parts[2]);
+      const episode = extractInt(parts[parts.length - 1]);
+      const season = extractInt(parts[parts.length - 2]);
       if (season && episode) {
         return { season, episode };
       }
@@ -670,6 +716,51 @@ function parseRequestedEpisode(type, id, query = {}) {
   }
 
   return null;
+}
+
+function ensureSpecialProviderConfigured() {
+  if (!EXTERNAL_SPECIAL_PROVIDER_URL) {
+    throw new Error('External metadata provider URL is not configured');
+  }
+}
+
+function cleanSpecialSearchTitle(rawTitle) {
+  if (!rawTitle) return null;
+  const lines = rawTitle
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const candidate = lines.length > 1 ? lines[1] : lines[0];
+  if (!candidate) return null;
+
+  const withoutTags = candidate.replace(/\bXXX.*$/i, '').replace(/\[[^\]]+\]/g, '');
+  const withoutCodec = withoutTags.replace(/\b\d{3,4}p\b/gi, '');
+  const normalized = withoutCodec
+    .replace(/[._]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  return normalized || null;
+}
+
+async function fetchSpecialMetadata(identifier) {
+  ensureSpecialProviderConfigured();
+  const trimmedBase = stripTrailingSlashes(EXTERNAL_SPECIAL_PROVIDER_URL);
+  const requestUrl = `${trimmedBase}/stream/movie/${encodeURIComponent(identifier)}.json`;
+  console.log('[SPECIAL META] Fetching metadata for external catalog request');
+
+  const response = await axios.get(requestUrl, { timeout: 10000 });
+  const streams = response.data?.streams;
+  const firstTitle = Array.isArray(streams) && streams.length > 0 ? streams[0]?.title : null;
+
+  const cleanedTitle = cleanSpecialSearchTitle(firstTitle);
+  if (!cleanedTitle) {
+    throw new Error('External metadata provider returned no usable title');
+  }
+
+  return {
+    title: cleanedTitle
+  };
 }
 
 function normalizeNzbdavPath(pathValue) {
@@ -684,6 +775,90 @@ function inferMimeType(fileName) {
   if (!fileName) return 'application/octet-stream';
   const ext = posixPath.extname(fileName.toLowerCase());
   return VIDEO_MIME_MAP.get(ext) || 'application/octet-stream';
+}
+
+function normalizeReleaseTitle(title) {
+  if (!title) return '';
+  return title.toString().trim().toLowerCase();
+}
+
+async function fetchCompletedNzbdavHistory(categories = []) {
+  ensureNzbdavConfigured();
+  const categoryList = Array.isArray(categories) && categories.length > 0
+    ? Array.from(new Set(categories.filter((value) => value !== undefined && value !== null && String(value).trim() !== '')))
+    : [null];
+
+  const results = new Map();
+
+  for (const category of categoryList) {
+    try {
+      const params = buildNzbdavApiParams('history', {
+        start: '0',
+        limit: String(NZBDAV_HISTORY_FETCH_LIMIT),
+        category: category || undefined
+      });
+
+      const headers = {};
+      if (NZBDAV_API_KEY) {
+        headers['x-api-key'] = NZBDAV_API_KEY;
+      }
+
+      const response = await axios.get(`${NZBDAV_URL}/api`, {
+        params,
+        timeout: NZBDAV_HISTORY_TIMEOUT_MS,
+        headers,
+        validateStatus: (status) => status < 500
+      });
+
+      if (!response.data?.status) {
+        const errorMessage = response.data?.error || `history returned status ${response.status}`;
+        throw new Error(errorMessage);
+      }
+
+      const history = response.data?.history || response.data?.History;
+      const slots = history?.slots || history?.Slots || [];
+
+      for (const slot of slots) {
+        const status = (slot?.status || slot?.Status || '').toString().toLowerCase();
+        if (status !== 'completed') {
+          continue;
+        }
+
+        const jobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || slot?.nzb_name || slot?.NzbName;
+        const nzoId = slot?.nzo_id || slot?.nzoId || slot?.NzoId;
+        if (!jobName || !nzoId) {
+          continue;
+        }
+
+        const normalized = normalizeReleaseTitle(jobName);
+        if (!normalized) {
+          continue;
+        }
+
+        if (!results.has(normalized)) {
+          results.set(normalized, {
+            nzoId,
+            jobName,
+            category: slot?.category || slot?.Category || category || null,
+            size: slot?.size || slot?.Size || null,
+            slot
+          });
+        }
+      }
+    } catch (error) {
+      console.warn(`[NZBDAV] Failed to fetch history for category ${category || 'all'}: ${error.message}`);
+    }
+  }
+
+  return results;
+}
+
+function buildNzbdavCacheKey(downloadUrl, category, requestedEpisode = null) {
+  const keyParts = [downloadUrl, category];
+  if (requestedEpisode && Number.isFinite(requestedEpisode.season) && Number.isFinite(requestedEpisode.episode)) {
+    keyParts.push(`${requestedEpisode.season}x${requestedEpisode.episode}`);
+  }
+  return keyParts.join('|');
 }
 
 async function safeStat(filePath) {
@@ -923,45 +1098,89 @@ async function getOrCreateNzbdavStream(cacheKey, builder) {
   }
 }
 
-async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisode }) {
-  try {
-    const { nzoId } = await addNzbToNzbdav(downloadUrl, category, title);
-    const slot = await waitForNzbdavHistorySlot(nzoId, category);
-    const slotCategory = slot?.category || slot?.Category || category;
-    const slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name;
-
-    if (!slotJobName) {
-      throw new Error('[NZBDAV] Unable to determine job name from history');
-    }
-
-    const bestFile = await findBestVideoFile({
-      category: slotCategory,
-      jobName: slotJobName,
-      requestedEpisode
-    });
-
-    if (!bestFile) {
-      throw new Error('[NZBDAV] No playable video files found after mounting NZB');
-    }
-
-    console.log(`[NZBDAV] Selected file ${bestFile.viewPath} (${bestFile.size} bytes)`);
-
-    return {
-      nzoId,
-      category: slotCategory,
-      jobName: slotJobName,
-      viewPath: bestFile.viewPath,
-      size: bestFile.size,
-      fileName: bestFile.name
-    };
-  } catch (error) {
-    if (error?.isNzbdavFailure) {
-      error.downloadUrl = downloadUrl;
-      error.category = category;
-      error.title = title;
-    }
-    throw error;
+async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisode, existingSlot = null }) {
+  let reuseError = null;
+  const attempts = [];
+  if (existingSlot?.nzoId) {
+    attempts.push('reuse');
   }
+  attempts.push('queue');
+
+  for (const mode of attempts) {
+    try {
+      let slot = null;
+      let nzoId = null;
+      let slotCategory = category;
+      let slotJobName = title;
+
+      if (mode === 'reuse') {
+        const reuseCategory = existingSlot?.category || category;
+        slot = await waitForNzbdavHistorySlot(existingSlot.nzoId, reuseCategory);
+        nzoId = existingSlot.nzoId;
+        slotCategory = slot?.category || slot?.Category || reuseCategory;
+        slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || existingSlot?.jobName || title;
+        console.log(`[NZBDAV] Reusing completed NZB ${slotJobName} (${nzoId})`);
+      } else {
+        const added = await addNzbToNzbdav(downloadUrl, category, title);
+        nzoId = added.nzoId;
+        slot = await waitForNzbdavHistorySlot(nzoId, category);
+        slotCategory = slot?.category || slot?.Category || category;
+        slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || title;
+      }
+
+      if (!slotJobName) {
+        throw new Error('[NZBDAV] Unable to determine job name from history');
+      }
+
+      const bestFile = await findBestVideoFile({
+        category: slotCategory,
+        jobName: slotJobName,
+        requestedEpisode
+      });
+
+      if (!bestFile) {
+        throw new Error('[NZBDAV] No playable video files found after mounting NZB');
+      }
+
+      console.log(`[NZBDAV] Selected file ${bestFile.viewPath} (${bestFile.size} bytes)`);
+
+      return {
+        nzoId,
+        category: slotCategory,
+        jobName: slotJobName,
+        viewPath: bestFile.viewPath,
+        size: bestFile.size,
+        fileName: bestFile.name
+      };
+    } catch (error) {
+      if (mode === 'reuse') {
+        reuseError = error;
+        console.warn(`[NZBDAV] Reuse attempt failed for NZB ${existingSlot?.nzoId || 'unknown'}: ${error.message}`);
+        continue;
+      }
+      if (error?.isNzbdavFailure) {
+        error.downloadUrl = downloadUrl;
+        error.category = category;
+        error.title = title;
+      }
+      throw error;
+    }
+  }
+
+  if (reuseError) {
+    if (reuseError?.isNzbdavFailure) {
+      reuseError.downloadUrl = downloadUrl;
+      reuseError.category = category;
+      reuseError.title = title;
+    }
+    throw reuseError;
+  }
+
+  const fallbackError = new Error('[NZBDAV] Unable to prepare NZB stream');
+  fallbackError.downloadUrl = downloadUrl;
+  fallbackError.category = category;
+  fallbackError.title = title;
+  throw fallbackError;
 }
 
 async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
@@ -1024,6 +1243,41 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
     headers.Range = 'bytes=0-0';
   }
 
+  let totalFileSize = null;
+  if (!req.headers.range && !emulateHead) {
+    const headConfig = {
+      url: targetUrl,
+      method: 'HEAD',
+      headers: {
+  'User-Agent': headers['User-Agent'] || `UsenetStreamer/${ADDON_VERSION}`
+      },
+      timeout: 30000,
+      validateStatus: (status) => status < 500
+    };
+
+    if (NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
+      headConfig.auth = {
+        username: NZBDAV_WEBDAV_USER,
+        password: NZBDAV_WEBDAV_PASS
+      };
+    }
+
+    try {
+      const headResponse = await axios.request(headConfig);
+      const headHeadersLower = Object.keys(headResponse.headers || {}).reduce((map, key) => {
+        map[key.toLowerCase()] = headResponse.headers[key];
+        return map;
+      }, {});
+      const headContentLength = headHeadersLower['content-length'];
+      if (headContentLength) {
+        totalFileSize = Number(headContentLength);
+        console.log(`[NZBDAV] HEAD reported total size ${totalFileSize} bytes for ${normalizedPath}`);
+      }
+    } catch (headError) {
+      console.warn('[NZBDAV] HEAD request failed; continuing without pre-fetched size:', headError.message);
+    }
+  }
+
   const requestConfig = {
     url: targetUrl,
     method: proxiedMethod,
@@ -1042,44 +1296,6 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
 
   console.log(`[NZBDAV] Proxying ${proxiedMethod}${emulateHead ? ' (HEAD emulation)' : ''} ${targetUrl}`);
 
-  // If no Range header was requested by client, we need to get file size first
-  let totalFileSize = null;
-  if (!req.headers.range && !emulateHead) {
-    try {
-      console.log('[NZBDAV] No range requested, fetching file size via HEAD...');
-      const headConfig = {
-        url: targetUrl,
-        method: 'HEAD',
-        headers: {
-          'User-Agent': headers['User-Agent'] || 'UsenetStreamer/1.0'
-        },
-        timeout: 30000,
-        validateStatus: (status) => status < 500
-      };
-      
-      if (NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
-        headConfig.auth = {
-          username: NZBDAV_WEBDAV_USER,
-          password: NZBDAV_WEBDAV_PASS
-        };
-      }
-      
-      const headResponse = await axios.request(headConfig);
-      const headHeadersLower = Object.keys(headResponse.headers || {}).reduce((map, key) => {
-        map[key.toLowerCase()] = headResponse.headers[key];
-        return map;
-      }, {});
-      
-      const contentLength = headHeadersLower['content-length'];
-      if (contentLength) {
-        totalFileSize = Number(contentLength);
-        console.log(`[NZBDAV] File size from HEAD: ${totalFileSize} bytes`);
-      }
-    } catch (headError) {
-      console.warn('[NZBDAV] HEAD request failed, will try without size:', headError.message);
-    }
-  }
-
   const nzbdavResponse = await axios.request(requestConfig);
 
   let responseStatus = nzbdavResponse.status;
@@ -1089,13 +1305,8 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
   }, {});
 
   const incomingContentRange = responseHeadersLower['content-range'];
-
-  // Force 206 status if Content-Range header exists (even if WebDAV returned 200)
-  if (incomingContentRange) {
-    if (responseStatus === 200) {
-      responseStatus = 206;
-      console.log('[NZBDAV] Converting HTTP 200 to 206 Partial Content (Content-Range detected)');
-    }
+  if (incomingContentRange && responseStatus === 200) {
+    responseStatus = 206;
   }
 
   res.status(responseStatus);
@@ -1191,36 +1402,86 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
 }
 
 // Manifest endpoint
-app.get('/:token/manifest.json', (req, res) => {
+function manifestHandler(req, res) {
   ensureAddonConfigured();
 
   res.json({
-  id: 'com.usenet.streamer',
-  version: '1.2.0',
-  name: 'UsenetStreamer',
-  description: 'Usenet-powered instant streams for Stremio via Prowlarr/NZBHydra and NZBDav',
-  logo: `${ADDON_BASE_URL.replace(/\/$/, '')}/assets/icon.png`,
+    id: 'com.usenet.streamer',
+    version: ADDON_VERSION,
+    name: 'UsenetStreamer',
+    description: 'Usenet-powered instant streams for Stremio via Prowlarr/NZBHydra and NZBDav',
+    logo: `${ADDON_BASE_URL.replace(/\/$/, '')}/assets/icon.png`,
     resources: ['stream'],
     types: ['movie', 'series', 'channel', 'tv'],
     catalogs: [],
-    idPrefixes: ['tt']
+    idPrefixes: ['tt', 'tvdb', 'pt', SPECIAL_ID_PREFIX]
   });
-});
+}
 
-app.get('/:token/stream/:type/:id.json', async (req, res) => {
+if (ADDON_SHARED_SECRET) {
+  app.get('/:token/manifest.json', manifestHandler);
+} else {
+  app.get('/manifest.json', manifestHandler);
+  app.get('/:token/manifest.json', manifestHandler);
+}
+
+async function streamHandler(req, res) {
   const { type, id } = req.params;
   console.log(`[REQUEST] Received request for ${type} ID: ${id}`);
 
-  const primaryId = id.split(':')[0];
-  if (!/^tt\d+$/.test(primaryId)) {
-  res.status(400).json({ error: `Unsupported ID prefix for indexer manager search: ${primaryId}` });
+  let baseIdentifier = id;
+  if (type === 'series' && typeof id === 'string') {
+    const parts = id.split(':');
+    if (parts.length >= 3) {
+      const potentialEpisode = Number.parseInt(parts[parts.length - 1], 10);
+      const potentialSeason = Number.parseInt(parts[parts.length - 2], 10);
+      if (Number.isFinite(potentialSeason) && Number.isFinite(potentialEpisode)) {
+        baseIdentifier = parts.slice(0, parts.length - 2).join(':');
+      }
+    }
+  }
+
+  let incomingImdbId = null;
+  let incomingTvdbId = null;
+  let incomingSpecialId = null;
+
+  if (/^tt\d+$/i.test(baseIdentifier)) {
+    incomingImdbId = baseIdentifier.startsWith('tt') ? baseIdentifier : `tt${baseIdentifier}`;
+    baseIdentifier = incomingImdbId;
+  } else if (/^tvdb:/i.test(baseIdentifier)) {
+    const tvdbMatch = baseIdentifier.match(/^tvdb:([0-9]+)(?::.*)?$/i);
+    if (tvdbMatch) {
+      incomingTvdbId = tvdbMatch[1];
+      baseIdentifier = `tvdb:${incomingTvdbId}`;
+    }
+  } else {
+    const lowerIdentifier = baseIdentifier.toLowerCase();
+    for (const prefix of specialCatalogPrefixes) {
+      const normalizedPrefix = prefix.toLowerCase();
+      if (lowerIdentifier.startsWith(`${normalizedPrefix}:`)) {
+        const remainder = baseIdentifier.slice(prefix.length + 1);
+        if (remainder) {
+          incomingSpecialId = remainder;
+          baseIdentifier = `${prefix}:${remainder}`;
+        }
+        break;
+      }
+    }
+  }
+
+  const isSpecialRequest = Boolean(incomingSpecialId);
+
+  if (!incomingImdbId && !incomingTvdbId && !isSpecialRequest) {
+    res.status(400).json({ error: `Unsupported ID prefix for indexer manager search: ${baseIdentifier}` });
     return;
   }
 
   try {
-  ensureAddonConfigured();
-  ensureIndexerManagerConfigured();
+    ensureAddonConfigured();
+    ensureIndexerManagerConfigured();
     ensureNzbdavConfigured();
+
+    const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
 
     const pickFirstDefined = (...values) => values.find((value) => value !== undefined && value !== null && String(value).trim() !== '') || null;
     const meta = req.query || {};
@@ -1257,11 +1518,35 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
     );
 
     const metaSources = [meta];
+    if (incomingImdbId) {
+      metaSources.push({ ids: { imdb: incomingImdbId }, imdb_id: incomingImdbId });
+    }
+    if (incomingTvdbId) {
+      metaSources.push({ ids: { tvdb: incomingTvdbId }, tvdb_id: incomingTvdbId });
+    }
+    let specialMetadata = null;
+    if (isSpecialRequest) {
+      try {
+        specialMetadata = await fetchSpecialMetadata(baseIdentifier);
+        if (specialMetadata?.title) {
+          metaSources.push({ title: specialMetadata.title, name: specialMetadata.title });
+          console.log('[SPECIAL META] Resolved title for external catalog request', { title: specialMetadata.title });
+        }
+      } catch (error) {
+        console.error('[SPECIAL META] Failed to resolve metadata:', error.message);
+        res.status(502).json({ error: 'Failed to resolve external metadata' });
+        return;
+      }
+    }
     let cinemetaMeta = null;
 
-    const needsCinemeta = (!hasTitleInQuery) || (type === 'series' && !hasTvdbInQuery) || (type === 'movie' && !hasTmdbInQuery);
+    const needsCinemeta = !incomingTvdbId && !isSpecialRequest && (
+      (!hasTitleInQuery) ||
+      (type === 'series' && !hasTvdbInQuery) ||
+      (type === 'movie' && !hasTmdbInQuery)
+    );
     if (needsCinemeta) {
-      const cinemetaPath = type === 'series' ? `series/${primaryId}.json` : `${type}/${primaryId}.json`;
+      const cinemetaPath = type === 'series' ? `series/${baseIdentifier}.json` : `${type}/${baseIdentifier}.json`;
       const cinemetaUrl = `${CINEMETA_URL}/${cinemetaPath}`;
       try {
         console.log(`[CINEMETA] Fetching metadata from ${cinemetaUrl}`);
@@ -1278,7 +1563,7 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
           console.warn(`[CINEMETA] No metadata payload returned for ${cinemetaUrl}`);
         }
       } catch (error) {
-        console.warn(`[CINEMETA] Failed to fetch metadata for ${primaryId}: ${error.message}`);
+        console.warn(`[CINEMETA] Failed to fetch metadata for ${baseIdentifier}: ${error.message}`);
       }
     }
 
@@ -1300,15 +1585,8 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
       return collected;
     };
 
-    let seasonNum = null;
-    let episodeNum = null;
-    if (type === 'series' && id.includes(':')) {
-      const [, season, episode] = id.split(':');
-      const parsedSeason = Number.parseInt(season, 10);
-      const parsedEpisode = Number.parseInt(episode, 10);
-      seasonNum = Number.isFinite(parsedSeason) ? parsedSeason : null;
-      episodeNum = Number.isFinite(parsedEpisode) ? parsedEpisode : null;
-    }
+    const seasonNum = requestedEpisode?.season ?? null;
+    const episodeNum = requestedEpisode?.episode ?? null;
 
     const normalizeImdb = (value) => {
       if (value === null || value === undefined) return null;
@@ -1336,7 +1614,7 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
             (src) => src?.ids?.imdb,
             (src) => src?.externals?.imdb
           ),
-          primaryId
+          incomingImdbId
         )
       ),
       tmdb: normalizeNumericId(
@@ -1363,7 +1641,8 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
             (src) => src?.externals?.tvdb,
             (src) => src?.tvdbSlug,
             (src) => src?.tvdbid
-          )
+          ),
+          incomingTvdbId
         )
       )
     };
@@ -1378,7 +1657,7 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
       return Number.isFinite(parsed) ? parsed : null;
     };
 
-    const movieTitle = pickFirstDefined(
+    let movieTitle = pickFirstDefined(
       ...collectValues(
         (src) => src?.title,
         (src) => src?.name,
@@ -1387,7 +1666,7 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
       )
     );
 
-    const releaseYear = extractYear(
+    let releaseYear = extractYear(
       pickFirstDefined(
         ...collectValues(
           (src) => src?.year,
@@ -1397,6 +1676,17 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
         )
       )
     );
+
+    if (!movieTitle && specialMetadata?.title) {
+      movieTitle = specialMetadata.title;
+    }
+
+    if (!releaseYear && specialMetadata?.year) {
+      const specialYear = extractYear(specialMetadata.year);
+      if (specialYear) {
+        releaseYear = specialYear;
+      }
+    }
 
     console.log('[REQUEST] Resolved title/year', { movieTitle, releaseYear });
 
@@ -1460,17 +1750,26 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
       textQueryParts.push(`S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`);
     }
 
-    // Only add text-based search if strict ID matching is disabled
-    if (!INDEXER_MANAGER_STRICT_ID_MATCH) {
-      const textQueryFallback = (textQueryParts.join(' ').trim() || primaryId).trim();
-      const addedTextPlan = addPlan('search', { rawQuery: textQueryFallback });
-      if (addedTextPlan) {
-        console.log(`${INDEXER_LOG_PREFIX} Added text search plan`, { query: textQueryFallback });
+  const shouldForceTextSearch = isSpecialRequest;
+    const shouldAddTextSearch = shouldForceTextSearch || (!INDEXER_MANAGER_STRICT_ID_MATCH && !incomingTvdbId);
+
+    if (shouldAddTextSearch) {
+      const fallbackIdentifier = incomingImdbId || baseIdentifier;
+      const textQueryCandidate = textQueryParts.join(' ').trim();
+      const textQueryFallback = (textQueryCandidate || fallbackIdentifier).trim();
+      if (textQueryFallback) {
+        const addedTextPlan = addPlan('search', { rawQuery: textQueryFallback });
+        if (addedTextPlan) {
+          console.log(`${INDEXER_LOG_PREFIX} Added text search plan`, { query: textQueryFallback });
+        } else {
+          console.log(`${INDEXER_LOG_PREFIX} Text search plan already present`, { query: textQueryFallback });
+        }
       } else {
-        console.log(`${INDEXER_LOG_PREFIX} Text search plan already present`, { query: textQueryFallback });
+        console.log(`${INDEXER_LOG_PREFIX} Skipping text search plan; insufficient metadata`);
       }
     } else {
-      console.log(`${INDEXER_LOG_PREFIX} Strict ID matching enabled; skipping text-based search`);
+      const reason = INDEXER_MANAGER_STRICT_ID_MATCH ? 'strict ID matching enabled' : 'tvdb identifier provided';
+      console.log(`${INDEXER_LOG_PREFIX} ${reason}; skipping text-based search`);
     }
 
     if (INDEXER_MANAGER_INDEXERS) {
@@ -1597,6 +1896,19 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
 
   console.log(`${INDEXER_LOG_PREFIX} Final NZB selection: ${finalNzbResults.length} results`);
 
+    cleanupNzbdavCache();
+
+    const categoryForType = getNzbdavCategory(type);
+    let historyByTitle = new Map();
+    try {
+      historyByTitle = await fetchCompletedNzbdavHistory([categoryForType]);
+      if (historyByTitle.size > 0) {
+        console.log(`[NZBDAV] Loaded ${historyByTitle.size} completed NZBs for instant playback detection (category=${categoryForType})`);
+      }
+    } catch (historyError) {
+      console.warn(`[NZBDAV] Unable to load NZBDav history for instant detection: ${historyError.message}`);
+    }
+
     const addonBaseUrl = ADDON_BASE_URL.replace(/\/$/, '');
 
     const streams = finalNzbResults
@@ -1617,10 +1929,31 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
         baseParams.set('downloadUrl', result.downloadUrl);
   if (result.guid) baseParams.set('guid', result.guid);
   if (result.size) baseParams.set('size', String(result.size));
-  if (result.title) baseParams.set('title', result.title);
+    if (result.title) baseParams.set('title', result.title);
 
-        const tokenPath = ADDON_SHARED_SECRET ? `/${ADDON_SHARED_SECRET}` : '';
-        const streamUrl = `${addonBaseUrl}${tokenPath}/nzb/stream?${baseParams.toString()}`;
+        const cacheKey = buildNzbdavCacheKey(result.downloadUrl, categoryForType, requestedEpisode);
+        const cacheEntry = nzbdavStreamCache.get(cacheKey);
+        const normalizedTitle = normalizeReleaseTitle(result.title);
+        const historySlot = normalizedTitle ? historyByTitle.get(normalizedTitle) : null;
+        const isInstant = cacheEntry?.status === 'ready' || Boolean(historySlot);
+
+        if (historySlot?.nzoId) {
+          baseParams.set('historyNzoId', historySlot.nzoId);
+          if (historySlot.jobName) {
+            baseParams.set('historyJobName', historySlot.jobName);
+          }
+          if (historySlot.category) {
+            baseParams.set('historyCategory', historySlot.category);
+          }
+        }
+
+        const tokenSegment = ADDON_SHARED_SECRET ? `/${ADDON_SHARED_SECRET}` : '';
+        const streamUrl = `${addonBaseUrl}${tokenSegment}/nzb/stream?${baseParams.toString()}`;
+  const tags = [];
+  if (isInstant) tags.push('⚡ Instant');
+  tags.push('📰 NZB');
+  if (quality) tags.push(quality);
+  if (sizeString) tags.push(sizeString);
         const name = 'UsenetStreamer';
         const behaviorHints = {
           notWebReady: true,
@@ -1630,8 +1963,15 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
           }
         };
 
+        if (isInstant) {
+          behaviorHints.cached = true;
+          if (historySlot) {
+            behaviorHints.cachedFromHistory = true;
+          }
+        }
+
         return {
-          title: `${result.title}\n${['📰 NZB', quality, sizeString].filter(Boolean).join(' • ')}\n${result.indexer}`,
+          title: `${result.title}\n${tags.filter(Boolean).join(' • ')}\n${result.indexer}`,
           name,
           url: streamUrl,
           behaviorHints,
@@ -1641,11 +1981,19 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
             size: result.size,
             quality,
             age: result.age,
-            type: 'nzb'
+            type: 'nzb',
+            cached: Boolean(isInstant),
+            cachedFromHistory: Boolean(historySlot),
+            cachedFromSession: cacheEntry?.status === 'ready'
           }
         };
       })
       .filter(Boolean);
+
+    const instantCount = streams.filter((stream) => stream?.meta?.cached).length;
+    if (instantCount > 0) {
+      console.log(`[STREMIO] ${instantCount}/${streams.length} streams already cached in NZBDav`);
+    }
 
     console.log(`[STREMIO] Returning ${streams.length} NZB streams`);
 
@@ -1663,7 +2011,14 @@ app.get('/:token/stream/:type/:id.json', async (req, res) => {
       }
     });
   }
-});
+}
+
+if (ADDON_SHARED_SECRET) {
+  app.get('/:token/stream/:type/:id.json', streamHandler);
+} else {
+  app.get('/stream/:type/:id.json', streamHandler);
+  app.get('/:token/stream/:type/:id.json', streamHandler);
+}
 
 async function handleNzbdavStream(req, res) {
   const { downloadUrl, type = 'movie', id = '', title = 'NZB Stream' } = req.query;
@@ -1676,31 +2031,34 @@ async function handleNzbdavStream(req, res) {
   try {
     const category = getNzbdavCategory(type);
     const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
-    const cacheKeyParts = [downloadUrl, category];
-    if (requestedEpisode) {
-      cacheKeyParts.push(`${requestedEpisode.season}x${requestedEpisode.episode}`);
-    }
-    const cacheKey = cacheKeyParts.join('|');
+    const cacheKey = buildNzbdavCacheKey(downloadUrl, category, requestedEpisode);
+    const existingSlotHint = req.query.historyNzoId
+      ? {
+          nzoId: req.query.historyNzoId,
+          jobName: req.query.historyJobName,
+          category: req.query.historyCategory
+        }
+      : null;
 
     const streamData = await getOrCreateNzbdavStream(cacheKey, () =>
-      buildNzbdavStream({ downloadUrl, category, title, requestedEpisode })
+      buildNzbdavStream({ downloadUrl, category, title, requestedEpisode, existingSlot: existingSlotHint })
     );
 
-      if ((req.method || 'GET').toUpperCase() === 'HEAD') {
-        const inferredMime = inferMimeType(streamData.fileName || title || 'stream');
-        const totalSize = Number.isFinite(streamData.size) ? streamData.size : undefined;
-        res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Content-Type', inferredMime);
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type');
-        res.setHeader('Content-Disposition', `inline; filename="${(streamData.fileName || 'stream').replace(/[\/:*?"<>|]+/g, '_')}"`);
-        if (Number.isFinite(totalSize)) {
-          res.setHeader('Content-Length', String(totalSize));
-          res.setHeader('X-Total-Length', String(totalSize));
-        }
-        res.status(200).end();
-        return;
+    if ((req.method || 'GET').toUpperCase() === 'HEAD') {
+      const inferredMime = inferMimeType(streamData.fileName || title || 'stream');
+      const totalSize = Number.isFinite(streamData.size) ? streamData.size : undefined;
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Type', inferredMime);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
+      res.setHeader('Content-Disposition', `inline; filename="${(streamData.fileName || 'stream').replace(/[\\/:*?"<>|]+/g, '_')}"`);
+      if (Number.isFinite(totalSize)) {
+        res.setHeader('Content-Length', String(totalSize));
+        res.setHeader('X-Total-Length', String(totalSize));
       }
+      res.status(200).end();
+      return;
+    }
 
     await proxyNzbdavStream(req, res, streamData.viewPath, streamData.fileName || '');
   } catch (error) {
@@ -1725,10 +2083,16 @@ async function handleNzbdavStream(req, res) {
   }
 }
 
-app.get('/:token/nzb/stream', handleNzbdavStream);
-app.head('/:token/nzb/stream', handleNzbdavStream);
+if (ADDON_SHARED_SECRET) {
+  app.get('/:token/nzb/stream', handleNzbdavStream);
+  app.head('/:token/nzb/stream', handleNzbdavStream);
+} else {
+  app.get('/:token/nzb/stream', handleNzbdavStream);
+  app.head('/:token/nzb/stream', handleNzbdavStream);
+  app.get('/nzb/stream', handleNzbdavStream);
+  app.head('/nzb/stream', handleNzbdavStream);
+}
 
 app.listen(port, '0.0.0.0', () => {
   console.log(`Addon running at http://0.0.0.0:${port}`);
 });
-
