@@ -1,0 +1,16 @@
+services:
+  usenetstreamer:
+    build: .
+    container_name: usenetstreamer-dev
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - usenet_usenet-network
+      - proxy-network
+
+networks:
+  usenet_usenet-network:
+    external: true
+  proxy-network:
+    external: true
